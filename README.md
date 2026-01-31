@@ -10,13 +10,13 @@ PAM-based authentication proxy for integrating UGOS NAS with [authentik](https:/
 
 ## Overview
 
-This service enables authentik to authenticate UGOS NAS users without storing passwords. Each login attempt is validated
-in real-time via PAM (reading `/etc/shadow`).
+This service enables authentik to authenticate UGOS NAS users without storing passwords and supports automatic user provisioning. Each login attempt is validated in real-time via PAM (reading `/etc/shadow`).
 
 **Key Features:**
 
 - 🔒 **No password caching** — every login is validated in real-time
 - ⚡ **Instant sync** — password changes in UGOS apply immediately to SSO
+- 👤 **Auto-provisioning** — new users are automatically created in authentik on first login
 - 🛡️ **Simple & reliable** — PAM-based authentication
 
 ## Architecture
@@ -24,15 +24,24 @@ in real-time via PAM (reading `/etc/shadow`).
 ```
 ┌─────────────────┐     ┌──────────────────────┐     ┌─────────────────┐
 │    Browser      │────▶│     authentik        │────▶│ ugos-auth-proxy │
-│                 │     │  (Expression Policy) │     │   (PAM/shadow)  │
+│                 │     │  (Expression Policy) │     │  (PAM + passwd) │
 └─────────────────┘     └──────────────────────┘     └─────────────────┘
-                                                            │
-                                                            ▼
-                                                     ┌────────────────┐
-                                                     │  /etc/shadow   │
-                                                     │   (UGOS NAS)   │
-                                                     └────────────────┘
+                                                              │
+                                                              ▼
+                                                      ┌────────────────┐
+                                                      │  /etc/shadow   │
+                                                      │  /etc/passwd   │
+                                                      │  /etc/group    │
+                                                      │   (UGOS NAS)   │
+                                                      └────────────────┘
 ```
+
+**Flow:**
+1. User enters credentials in authentik
+2. authentik's Expression Policy calls ugos-auth-proxy `/validate`
+3. If user doesn't exist in authentik, policy calls `/user-info` to get user details
+4. Policy creates user in authentik with UGOS attributes
+5. User is logged in
 
 ## Quick Start
 
@@ -99,6 +108,38 @@ Validates user credentials via PAM.
 }
 ```
 
+### GET /user-info
+
+Retrieves user information from `/etc/passwd` and `/etc/group`. Used for auto-provisioning users in authentik.
+
+**Query Parameters:**
+- `username` (required) — UGOS username
+
+**Success Response (200):**
+
+```json
+{
+  "exists": true,
+  "username": "ugadmin",
+  "uid": 1026,
+  "gid": 100,
+  "full_name": "Admin User",
+  "email": "admin@example.com",
+  "home": "/var/services/homes/ugadmin",
+  "shell": "/bin/sh",
+  "groups": ["administrators", "users", "http"]
+}
+```
+
+**User Not Found Response (200):**
+
+```json
+{
+  "exists": false,
+  "error": "User not found"
+}
+```
+
 ### GET /health
 
 Health check endpoint for monitoring and load balancers.
@@ -106,7 +147,8 @@ Health check endpoint for monitoring and load balancers.
 ```json
 {
   "status": "healthy",
-  "service": "ugos-auth-proxy"
+  "service": "ugos-auth-proxy",
+  "version": "0.2.0"
 }
 ```
 
@@ -122,76 +164,79 @@ Readiness probe for Kubernetes.
 
 ## authentik Integration
 
-### 1. Create Authentication Flow
+### 1. Create Groups
+
+Create the following groups in authentik (Directory -> Groups):
+
+| Group Name   | Description                        |
+|--------------|------------------------------------|
+| `UGOS Users` | All auto-provisioned UGOS users    |
+| `admins`     | Administrators (mapped from UGOS)  |
+| `family`     | Family members (mapped from UGOS)  |
+
+### 2. Create Authentication Flow
 
 Create a flow named `ugos-authentication` with the following stages:
 
-| Order | Stage                      | Type                |
-|-------|----------------------------|---------------------|
-| 10    | ugos-find-user-stage       | IdentificationStage |
-| 20    | ugos-password-prompt-stage | PromptStage         |
-| 25    | ugos-password-deny-stage   | DenyStage           |
-| 100   | ugos-user-login-stage      | UserLoginStage      |
+| Order | Stage                      | Type                | Configuration                     |
+|-------|----------------------------|---------------------|-----------------------------------|
+| 10    | ugos-find-user-stage       | IdentificationStage | `pretend_user_exists=True`        |
+| 20    | ugos-password-prompt-stage | PromptStage         | Password field only               |
+| 25    | ugos-password-deny-stage   | DenyStage           | Policy binding with `negate=True` |
+| 100   | ugos-user-login-stage      | UserLoginStage      | Default settings                  |
 
-### 2. Create Expression Policy
+> **Important:** Set `pretend_user_exists=True` on IdentificationStage to enable auto-provisioning for new users.
 
-Create a policy named `ugos-password-validation-policy` and bind it to `ugos-password-deny-stage` with **negate=True**:
+### 3. Create Expression Policy
 
-```python
-import requests
+Create a policy named `ugos-password-validation-policy` and bind it to `ugos-password-deny-stage` with **negate=True**.
 
-password = request.context.get("prompt_data", {}).get("password")
-if not password:
-    ak_message("Password is required")
-    return False
+This policy handles both password validation and auto-provisioning.
 
-user = request.context.get("pending_user")
-if not user:
-    ak_message("User not found")
-    return False
+📄 **Copy the policy code from:** [`authentik-policy.py`](authentik-policy.py)
 
-# Check ugos_user attribute
-is_ugos_user = user.attributes.get("ugos_user", False)
-if not is_ugos_user:
-    # Local user - verify via authentik
-    if user.check_password(password):
-        return True
-    else:
-        ak_message("Invalid password")
-        return False
+> **Configuration:** Edit the variables at the top of the policy:
+> - `UGOS_AUTH_PROXY_URL` — your ugos-auth-proxy address
+> - `DEFAULT_EMAIL_DOMAIN` — default email domain for users
+> - `GROUP_MAP` — UGOS to authentik group mapping
 
-# UGOS user - verify via UGOS Auth Proxy
-try:
-    response = requests.post(
-        "http://192.168.0.40:8180/validate",  # Change to your address
-        json={"username": user.username, "password": password},
-        timeout=5
-    )
-    result = response.json()
-    
-    if result.get("valid", False):
-        return True
-    else:
-        ak_message("Invalid password")
-        return False
-except Exception as e:
-    ak_message(f"Authentication service error: {str(e)}")
-    return False
-```
 
-### 3. Configure Users
+### 4. Group Mapping
 
-UGOS users must have the following attribute in authentik:
+The policy automatically maps UGOS groups to authentik groups:
+
+| UGOS Group | authentik Group | Description        |
+|------------|-----------------|--------------------|
+| `admin`    | `admins`        | NAS administrators |
+| `family`   | `family`        | Family members     |
+
+All auto-provisioned users are added to `UGOS Users` group.
+
+### 5. User Attributes
+
+Auto-provisioned users will have these attributes:
 
 ```json
 {
-  "ugos_user": true
+  "ugos_user": true,
+  "ugos_uid": 1005,
+  "ugos_gid": 10,
+  "ugos_groups": ["admin", "users", "ughomeusers"],
+  "ugos_home": "/home/ugadmin",
+  "auto_provisioned": true
 }
 ```
 
-### 4. Set Default Flow
+### 6. Set Default Flow
 
-In Brand settings, set `ugos-authentication` as the default authentication flow.
+In Brand settings (System -> Brands), set `ugos-authentication` as the default authentication flow.
+
+### 7. Local Admin Access
+
+For emergency access with local admin (e.g., `akadmin`), use:
+```
+https://your-authentik-url/if/flow/default-authentication-flow/
+```
 
 ## Configuration
 
@@ -214,6 +259,9 @@ curl -X POST http://localhost:8180/validate \
   -H "Content-Type: application/json" \
   -d '{"username":"ugadmin","password":"wrong_password"}'
 
+# Get user info
+curl "http://localhost:8180/user-info?username=ugadmin"
+
 # Health check
 curl http://localhost:8180/health
 ```
@@ -222,9 +270,10 @@ curl http://localhost:8180/health
 
 ⚠️ **Important:**
 
-1. The container requires access to `/etc/shadow` — mounted as read-only
+1. The container requires access to `/etc/shadow`, `/etc/passwd`, `/etc/group` — mounted as read-only
 2. **Do not expose** the port externally — use internal Docker network only
 3. Consider using HTTPS between authentik and proxy (via reverse proxy)
+4. The `/user-info` endpoint only exposes public user data (no passwords)
 
 ## Why PAM Instead of UGOS API?
 

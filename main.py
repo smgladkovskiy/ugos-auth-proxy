@@ -2,13 +2,21 @@
 """
 UGOS Auth Proxy - PAM-based authentication proxy for authentik SSO.
 
-This service validates user credentials against UGOS system via PAM/shadow.
+This service validates user credentials against UGOS system via PAM/shadow
+and provides user information for auto-provisioning in authentik.
+
 Used by authentik as a custom authentication backend through Expression Policy.
 
 The proxy requires root access to read /etc/shadow for PAM authentication.
 
+Endpoints:
+  - POST /validate  - Validate user credentials via PAM
+  - GET  /user-info - Get user information from /etc/passwd and /etc/group
+  - GET  /health    - Health check
+  - GET  /ready     - Readiness probe
+
 Deployment options:
-  - Docker container with /etc/shadow mounted (recommended)
+  - Docker container with /etc/shadow, /etc/passwd, /etc/group mounted (recommended)
   - Systemd service on the host
 
 Default port: 8080 (configurable via PORT environment variable)
@@ -20,14 +28,17 @@ License: MIT
 from __future__ import annotations
 
 import crypt
+import grp
 import json
 import logging
 import os
+import pwd
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
-__version__ = "1.0.0"
+__version__ = "0.2.0"
 __author__ = "Sergey Gladkovskiy <smgladkovskiy@gmail.com>"
 
 # Configuration
@@ -97,6 +108,70 @@ def authenticate_pam(username: str, password: str) -> bool:
         return False
 
 
+def get_user_info(username: str) -> dict[str, Any] | None:
+    """
+    Get user information from /etc/passwd and /etc/group.
+
+    Args:
+        username: The username to look up.
+
+    Returns:
+        Dictionary with user info or None if user not found.
+    """
+    try:
+        pw_entry = pwd.getpwnam(username)
+    except KeyError:
+        logger.warning("User '%s' not found in passwd database", username)
+        return None
+
+    # Get user's groups
+    user_groups = []
+    try:
+        # Primary group
+        primary_group = grp.getgrgid(pw_entry.pw_gid)
+        user_groups.append(primary_group.gr_name)
+    except KeyError:
+        pass
+
+    # Secondary groups
+    try:
+        all_groups = grp.getgrall()
+        for group in all_groups:
+            if username in group.gr_mem and group.gr_name not in user_groups:
+                user_groups.append(group.gr_name)
+    except Exception as e:
+        logger.warning("Error reading groups for user '%s': %s", username, e)
+
+    # Parse GECOS field for full name and email
+    # GECOS format: Full Name,Room,Work Phone,Home Phone,Other
+    # Some systems use: Full Name,,,email
+    gecos = pw_entry.pw_gecos
+    full_name = username
+    email = ""
+
+    if gecos:
+        gecos_parts = gecos.split(",")
+        if gecos_parts[0]:
+            full_name = gecos_parts[0]
+        # Check for email in GECOS (some systems store it there)
+        for part in gecos_parts[1:]:
+            if "@" in part:
+                email = part.strip()
+                break
+
+    return {
+        "exists": True,
+        "username": username,
+        "uid": pw_entry.pw_uid,
+        "gid": pw_entry.pw_gid,
+        "full_name": full_name,
+        "email": email,
+        "home": pw_entry.pw_dir,
+        "shell": pw_entry.pw_shell,
+        "groups": user_groups,
+    }
+
+
 class AuthHandler(BaseHTTPRequestHandler):
     """HTTP request handler for authentication endpoints."""
 
@@ -140,16 +215,59 @@ class AuthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         """Handle GET requests."""
-        if self.path == "/health":
+        parsed_url = urlparse(self.path)
+        path = parsed_url.path
+
+        if path == "/health":
             self._send_json({
                 "status": "healthy",
                 "service": "ugos-auth-proxy",
                 "version": __version__,
             })
-        elif self.path == "/ready":
+        elif path == "/ready":
             self._send_json({"status": "ready"})
+        elif path == "/user-info":
+            self._handle_user_info(parsed_url.query)
         else:
             self._send_json({"error": "Not found"}, 404)
+
+    def _handle_user_info(self, query_string: str) -> None:
+        """
+        Handle GET /user-info request.
+
+        Args:
+            query_string: URL query string.
+        """
+        # Parse query parameters
+        params = parse_qs(query_string)
+        username_list = params.get("username", [])
+
+        if not username_list or not username_list[0]:
+            self._send_json(
+                {"exists": False, "error": "Username parameter is required"},
+                400,
+            )
+            return
+
+        username = username_list[0].strip()
+
+        if not username:
+            self._send_json(
+                {"exists": False, "error": "Username cannot be empty"},
+                400,
+            )
+            return
+
+        logger.info("Getting user info for '%s'", username)
+
+        user_info = get_user_info(username)
+
+        if user_info:
+            logger.info("User info retrieved for '%s'", username)
+            self._send_json(user_info)
+        else:
+            logger.info("User '%s' not found", username)
+            self._send_json({"exists": False, "error": "User not found"})
 
     def do_POST(self) -> None:  # noqa: N802
         """Handle POST requests for credential validation."""

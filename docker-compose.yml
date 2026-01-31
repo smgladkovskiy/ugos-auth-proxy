@@ -13,9 +13,10 @@ services:
     environment:
       - PORT=8080
     volumes:
-      # IMPORTANT: Mount /etc/shadow for PAM authentication (read-only)
+      # IMPORTANT: Mount system files for PAM authentication and user info (read-only)
       - /etc/shadow:/etc/shadow:ro
       - /etc/passwd:/etc/passwd:ro
+      - /etc/group:/etc/group:ro
     ports:
       - "8180:8080"
     healthcheck:
