@@ -219,11 +219,13 @@ class AuthHandler(BaseHTTPRequestHandler):
         path = parsed_url.path
 
         if path == "/health":
-            self._send_json({
-                "status": "healthy",
-                "service": "ugos-auth-proxy",
-                "version": __version__,
-            })
+            self._send_json(
+                {
+                    "status": "healthy",
+                    "service": "ugos-auth-proxy",
+                    "version": __version__,
+                }
+            )
         elif path == "/ready":
             self._send_json({"status": "ready"})
         elif path == "/user-info":
