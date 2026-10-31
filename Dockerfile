@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.15-slim
 
 LABEL maintainer="Sergey Gladkovskiy <smgladkovskiy@gmail.com>"
 LABEL description="UGOS Auth Proxy - PAM-based authentication for authentik SSO"
